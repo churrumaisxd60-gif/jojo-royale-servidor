@@ -1,0 +1,15 @@
+{
+  "name": "jojo-royale-servidor",
+  "version": "1.0.0",
+  "description": "Servidor en línea de JoJo Royale: amigos, salas y retransmisión de partidas",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
