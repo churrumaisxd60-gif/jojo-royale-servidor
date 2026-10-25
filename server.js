@@ -5,7 +5,8 @@
 // la sala (el anfitrión simula la batalla, como en la red local).
 //
 // Cliente -> servidor (campo "t"):
-//   hola        {id, nombre, tag, estado, amigos:[ids], v}   registrarse
+//   hola        {id, nombre, tag, estado, amigos:[ids], v, juego}  registrarse
+//               (juego = versión del APK: solo se emparejan versiones iguales)
 //   estado      {estado}                                     menu|grupo|partida
 //   amigos      {ids}                                         a quién seguir
 //   buscar      {riot:"Nombre#TAG", ref}                     -> buscado
@@ -15,10 +16,17 @@
 //   rapida      {} / rapida_cancelar {}                       emparejamiento al azar
 //   sala_salir  {}                                            -> sala_fin al rival
 //   ping        {}                                            -> pong
+//   reporte     {datos}        diagnóstico de un cierre inesperado (GET /reportes)
+//   pausa / sigo {}            la app pasó a segundo plano / volvió (en partida)
 // Servidor -> cliente: bienvenida, presencia {id,nombre,tag,estado}, fuera {id},
 //   buscado, msg {de,nombre,tag,datos}, no_conectado {a}, sala_creada,
 //   sala_lista {anfitrion, codigo, rival:{id,nombre,tag}}, sala_error {motivo},
-//   sala_fin {motivo}, rapida_esperando, pong.
+//   sala_fin {motivo}, rapida_esperando, pong, rival_ausente {segundos},
+//   rival_volvio, sala_reanudada {anfitrion, codigo}.
+//
+// Reconexión: si a un jugador se le corta la conexión en plena partida, la
+// sala le espera GRACIA_MS (el rival recibe rival_ausente y pausa); si vuelve
+// con el mismo id recupera su sitio (sala_reanudada / rival_volvio).
 //
 // Nada se guarda en disco (el plan gratis de Render no tiene disco
 // persistente): las amistades las guarda cada juego en su perfil; el
@@ -30,7 +38,9 @@ const { WebSocketServer } = require("ws");
 const PUERTO = process.env.PORT || 8080;
 const VERSION = 1;
 const MAX_JUGADORES = 2000;
-const MAX_MENSAJE = 64 * 1024;
+const MAX_MENSAJE = 1024 * 1024;
+const GRACIA_MS = 25000;
+const MAX_REPORTES = 300;
 const ALFABETO_CODIGO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /** id -> conexión */
@@ -39,8 +49,14 @@ const jugadores = new Map();
 const salas = new Map();
 /** conexiones esperando batalla rápida */
 let colaRapida = [];
+/** últimos diagnósticos de cierres inesperados (sin nombres ni ids) */
+const reportes = [];
 
 const servidor = http.createServer((req, res) => {
+  if (req.url && req.url.startsWith("/reportes")) {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify(reportes, null, 1));
+  }
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
   res.end(`JoJo Royale en línea OK · ${jugadores.size} conectados · ${salas.size} salas\n`);
 });
@@ -85,12 +101,60 @@ function salirDeSala(ws, motivo) {
   const sala = salas.get(codigo);
   if (!sala) return;
   salas.delete(codigo);
+  if (sala.ausente) clearTimeout(sala.ausente.timer);
   const rival = sala.anfitrion === ws ? sala.invitado : sala.anfitrion;
   if (rival) {
     rival.sala = null;
     enviar(rival, { t: "sala_fin", motivo });
   }
 }
+
+/** Se cortó la conexión de `ws` en plena partida (o salió de la app): la sala
+ *  le guarda el sitio GRACIA_MS. */
+function esperarReconexion(ws, motivo = "El rival se desconectó") {
+  const sala = ws.sala && salas.get(ws.sala);
+  if (!sala || !sala.invitado || !ws.id) return false;
+  if (sala.ausente) {
+    // Ya estaba en pausa (salió de la app) y ahora además se cortó: sigue esperándole.
+    return sala.ausente.id === ws.id;
+  }
+  const rival = sala.anfitrion === ws ? sala.invitado : sala.anfitrion;
+  if (!rival || rival.readyState !== 1) return false;
+  sala.ausente = {
+    id: ws.id,
+    timer: setTimeout(() => {
+      sala.ausente = null;
+      if (salas.get(sala.codigo) === sala && (sala.anfitrion === ws || sala.invitado === ws)) {
+        salirDeSala(ws, motivo);
+      }
+    }, GRACIA_MS),
+  };
+  enviar(rival, { t: "rival_ausente", segundos: GRACIA_MS / 1000 });
+  return true;
+}
+
+/** `ws` (recién llegado con el id de un jugador en partida) ocupa el sitio de `viejo`. */
+function reanudar(ws, viejo) {
+  const sala = viejo && viejo.sala && salas.get(viejo.sala);
+  if (!sala || !sala.invitado) return false;
+  const anfitrion = sala.anfitrion === viejo;
+  if (anfitrion) sala.anfitrion = ws;
+  else if (sala.invitado === viejo) sala.invitado = ws;
+  else return false;
+  if (sala.ausente) clearTimeout(sala.ausente.timer);
+  sala.ausente = null;
+  viejo.sala = null;
+  ws.sala = sala.codigo;
+  enviar(ws, { t: "sala_reanudada", anfitrion, codigo: sala.codigo });
+  enviar(anfitrion ? sala.invitado : sala.anfitrion, { t: "rival_volvio" });
+  return true;
+}
+
+function mismaVersion(a, b) {
+  return (a.juego || "") === (b.juego || "");
+}
+
+const AVISO_VERSION = "Tu amigo tiene otra versión del juego: instalen los dos el mismo APK";
 
 function emparejar(anfitrion, invitado, codigo) {
   const sala = { anfitrion, invitado, codigo };
@@ -113,10 +177,12 @@ wss.on("connection", (ws) => {
   ws.estado = "menu";
   ws.sala = null;
   ws.vivo = true;
+  ws.ultimo = Date.now();
   ws.on("pong", () => (ws.vivo = true));
 
   ws.on("message", (datos, binario) => {
     ws.vivo = true;
+    ws.ultimo = Date.now();
     if (binario) {
       // Paquete de la partida: directo al rival.
       const rival = rivalDe(ws);
@@ -136,20 +202,33 @@ wss.on("connection", (ws) => {
         const id = texto(m.id, 32);
         if (!/^[0-9a-f]{16}$/.test(id)) return ws.close(4000, "id inválido");
         if (jugadores.size >= MAX_JUGADORES && !jugadores.has(id)) return ws.close(4001, "servidor lleno");
-        // La misma persona conectada dos veces: gana la última.
+        // La misma persona conectada dos veces: gana la última. Si estaba en
+        // una partida (se le cortó la red y volvió), recupera su sitio.
         const viejo = jugadores.get(id);
+        let reanudada = false;
         if (viejo && viejo !== ws) {
-          salirDeSala(viejo, "Te conectaste desde otro sitio");
+          reanudada = reanudar(ws, viejo);
+          if (!reanudada) salirDeSala(viejo, "Te conectaste desde otro sitio");
           viejo.id = null;
-          viejo.close(4002, "sesión reemplazada");
+          if (viejo.readyState === 1) viejo.close(4002, "sesión reemplazada");
         }
         ws.id = id;
+        ws.juego = texto(m.juego, 12);
         ws.nombre = texto(m.nombre, 16);
         ws.tag = texto(m.tag, 5).toUpperCase();
         ws.estado = texto(m.estado || "menu", 12);
         ws.amigos = new Set((Array.isArray(m.amigos) ? m.amigos : []).slice(0, 300).map((x) => texto(x, 32)));
         jugadores.set(id, ws);
         enviar(ws, { t: "bienvenida", v: VERSION, conectados: jugadores.size });
+        if (!reanudada) {
+          // El socket viejo ya se cerró, pero su sitio en la partida sigue guardado.
+          for (const sala of salas.values()) {
+            if (sala.ausente && sala.ausente.id === id) {
+              reanudar(ws, sala.anfitrion.id === id ? sala.anfitrion : sala.invitado);
+              break;
+            }
+          }
+        }
         for (const a of ws.amigos) {
           const amigo = jugadores.get(a);
           if (amigo) enviar(ws, { t: "presencia", ...publico(amigo) });
@@ -205,6 +284,7 @@ wss.on("connection", (ws) => {
         if (!sala) return enviar(ws, { t: "sala_error", motivo: "No existe la sala " + codigo });
         if (sala.invitado) return enviar(ws, { t: "sala_error", motivo: "La sala ya está llena" });
         if (sala.anfitrion === ws) return enviar(ws, { t: "sala_error", motivo: "Es tu propia sala" });
+        if (!mismaVersion(sala.anfitrion, ws)) return enviar(ws, { t: "sala_error", motivo: AVISO_VERSION });
         salirDeSala(ws, "El rival salió");
         salas.delete(codigo);
         emparejar(sala.anfitrion, ws, codigo);
@@ -213,7 +293,8 @@ wss.on("connection", (ws) => {
       case "rapida": {
         salirDeSala(ws, "El rival salió");
         colaRapida = colaRapida.filter((c) => c.readyState === 1 && c !== ws && !c.sala);
-        const rival = colaRapida.shift();
+        const i = colaRapida.findIndex((c) => mismaVersion(c, ws));
+        const rival = i >= 0 ? colaRapida.splice(i, 1)[0] : null;
         if (rival) {
           const codigo = codigoNuevo();
           emparejar(rival, ws, codigo);
@@ -232,11 +313,36 @@ wss.on("connection", (ws) => {
       case "ping":
         enviar(ws, { t: "pong" });
         break;
+      case "pausa":
+        esperarReconexion(ws, "El rival salió del juego");
+        break;
+      case "sigo": {
+        const sala = ws.sala && salas.get(ws.sala);
+        if (sala && sala.ausente && sala.ausente.id === ws.id) {
+          clearTimeout(sala.ausente.timer);
+          sala.ausente = null;
+          enviar(rivalDe(ws), { t: "rival_volvio" });
+        }
+        break;
+      }
+      case "reporte": {
+        const d = m.datos && typeof m.datos === "object" ? m.datos : {};
+        const limpio = { cuando: new Date().toISOString(), juego: ws.juego };
+        for (const k of Object.keys(d).slice(0, 30)) {
+          if (k === "id" || k === "nombre" || k === "tag") continue;
+          const v = d[k];
+          limpio[texto(k, 24)] = typeof v === "number" || typeof v === "boolean" ? v : texto(v, 120);
+        }
+        reportes.push(limpio);
+        if (reportes.length > MAX_REPORTES) reportes.shift();
+        break;
+      }
     }
   });
 
   ws.on("close", () => {
-    salirDeSala(ws, "El rival se desconectó");
+    colaRapida = colaRapida.filter((c) => c !== ws);
+    if (!esperarReconexion(ws)) salirDeSala(ws, "El rival se desconectó");
     if (ws.id && jugadores.get(ws.id) === ws) {
       jugadores.delete(ws.id);
       anunciar(ws, true);
@@ -256,5 +362,17 @@ setInterval(() => {
     ws.ping();
   }
 }, 30000);
+
+// En partida los juegos nuevos mandan un latido cada 2 s: si uno calla
+// SILENCIO_MS (perdió la señal sin avisar), se le da por caído ya y su sitio
+// queda guardado (esperarReconexion) en vez de esperar al ping de 60 s.
+const SILENCIO_MS = 8000;
+setInterval(() => {
+  const ahora = Date.now();
+  for (const ws of wss.clients) {
+    const sala = ws.juego && ws.sala && salas.get(ws.sala);
+    if (sala && sala.invitado && ahora - ws.ultimo > SILENCIO_MS) ws.terminate();
+  }
+}, 2000);
 
 servidor.listen(PUERTO, () => console.log(`JoJo Royale en línea escuchando en ${PUERTO}`));
